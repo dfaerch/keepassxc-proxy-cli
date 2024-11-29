@@ -4,7 +4,10 @@ import os
 import json
 import binascii
 import getopt
+import re
 from keepassxc_proxy_client import protocol
+
+debug = 0
 
 def print_help():
     help_text = """
@@ -23,6 +26,14 @@ Options:
 """
     print(help_text)
 
+def debug_print(message):
+    if debug:
+        print(f"[DEBUG] {message}", file=sys.stderr)
+
+def error(message):
+    print(f"[ERROR] {message}", file=sys.stderr)
+    sys.exit(1)
+
 def main():
     # Default values
     keyfile_path = None
@@ -34,9 +45,7 @@ def main():
     try:
         opts, args = getopt.getopt(sys.argv[1:], "u:k:f:nh", ["url=", "keyfile=", "format=", "help"])
     except getopt.GetoptError as err:
-        print(str(err))
-        print_help()
-        sys.exit(1)
+        error(str(err))
 
     for opt, arg in opts:
         if opt in ("-u", "--url"):
@@ -56,59 +65,76 @@ def main():
         print_help()
         sys.exit(1)
 
-    # Initialize connection
-    connection = protocol.Connection()
-    connection.connect()
+    # Validate URL format
+    if not re.match(r'^[a-z0-9]+://', url):
+        error("URL must start with a valid scheme (e.g., https://, ssh://).")
 
-    if not os.path.exists(keyfile_path):
-        # Associate with KeePassXC and dump association details
-        connection.associate()
-        name, public_key = connection.dump_associate()
+    try:
+        # Initialize connection
+        connection = protocol.Connection()
+        connection.connect()
 
-        # Hex encode the binary public key for storage
-        public_key_hex = binascii.hexlify(public_key).decode('utf-8')
+        if not os.path.exists(keyfile_path):
+            # Associate with KeePassXC and dump association details
+            connection.associate()
+            name, public_key = connection.dump_associate()
 
-        association = {'id': name, 'key': public_key_hex}
+            # Hex encode the binary public key for storage
+            public_key_hex = binascii.hexlify(public_key).decode('utf-8')
 
-        # Save association to keyfile
-        with open(keyfile_path, 'w') as keyfile:
-            json.dump(association, keyfile)
-        print(f"Association created and saved to {keyfile_path} with name '{name}' and hex-encoded public key.")
+            association = {'id': name, 'key': public_key_hex}
 
-    else:
-        # Load existing association
+            # Save association to keyfile
+            with open(keyfile_path, 'w') as keyfile:
+                json.dump(association, keyfile)
+            debug_print("Association created and saved to {} with name '{}' and hex-encoded public key.".format(keyfile_path, name))
+
+        else:
+            # Load existing association
+            try:
+                with open(keyfile_path, 'r') as keyfile:
+                    association = json.load(keyfile)
+                # Ensure association contains 'id' and 'key'
+                if not isinstance(association, dict) or 'id' not in association or 'key' not in association:
+                    raise ValueError("Invalid association file format.")
+
+                # Decode the hex-encoded public key back to binary
+                public_key = binascii.unhexlify(association['key'])
+                connection.load_associate(association['id'], public_key)
+                debug_print("Loaded association from {}.".format(keyfile_path))
+            except (json.JSONDecodeError, ValueError, binascii.Error) as e:
+                error(f"Failed to load association: {e}")
+                error("Please delete the keyfile and re-run the script to re-associate.")
+
+        # Test association
         try:
-            with open(keyfile_path, 'r') as keyfile:
-                association = json.load(keyfile)
-            # Ensure association contains 'id' and 'key'
-            if not isinstance(association, dict) or 'id' not in association or 'key' not in association:
-                raise ValueError("Invalid association file format.")
+            if not connection.test_associate():
+                error("Association test failed. Please re-associate.")
+        except protocol.ResponseUnsuccesfulException as e:
+            error_data = e.args[0] if e.args else {}
+            error_message = error_data.get("error", "Unknown error")
+            error_code = error_data.get("errorCode", "1")
+            error(f"Connection error: {error_message} (Code: {error_code})")
 
-            # Decode the hex-encoded public key back to binary
-            public_key = binascii.unhexlify(association['key'])
-            connection.load_associate(association['id'], public_key)
-            print(f"Loaded association from {keyfile_path}.")
-        except (json.JSONDecodeError, ValueError, binascii.Error) as e:
-            print(f"Failed to load association: {e}")
-            print("Please delete the keyfile and re-run the script to re-associate.")
-            sys.exit(1)
+        # Retrieve logins for the specified URL
+        try:
+            logins = connection.get_logins(url)
+            if logins:
+                for login in logins:
+                    formatted_output = (output_format
+                                        .replace('%n', login.get('name', 'N/A'))
+                                        .replace('%l', login.get('login', 'N/A'))
+                                        .replace('%p', login.get('password', 'N/A')))
+                    print(formatted_output, end=("" if not add_newline else "\n"))
+            else:
+                error(f"No logins found for URL: {url}")
+        except protocol.ResponseUnsuccesfulException as e:
+            error_data = e.args[0] if e.args else {}
+            error_message = error_data.get("error", "Unknown error")
+            error(f"Error retrieving logins: {error_message}")
 
-    # Test association
-    if not connection.test_associate():
-        print("Association test failed. Please re-associate.")
-        sys.exit(1)
-
-    # Retrieve logins for the specified URL
-    logins = connection.get_logins(url)
-    if logins:
-        for login in logins:
-            formatted_output = (output_format
-                                .replace('%n', login.get('name', 'N/A'))
-                                .replace('%l', login.get('login', 'N/A'))
-                                .replace('%p', login.get('password', 'N/A')))
-            print(formatted_output, end=("" if not add_newline else "\n"))
-    else:
-        print(f"No logins found for URL: {url}")
+    except Exception as e:
+        error(f"Unexpected error: {e}")
 
 if __name__ == "__main__":
     main()

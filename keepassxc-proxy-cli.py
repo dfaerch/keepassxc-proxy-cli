@@ -103,8 +103,7 @@ def main():
                 connection.load_associate(association['id'], public_key)
                 debug_print("Loaded association from {}.".format(keyfile_path))
             except (json.JSONDecodeError, ValueError, binascii.Error) as e:
-                error(f"Failed to load association: {e}")
-                error("Please delete the keyfile and re-run the script to re-associate.")
+                error(f"Failed to load association: {e}\n\nPlease delete the keyfile and re-run the script to re-associate.")
 
         # Test association
         try:

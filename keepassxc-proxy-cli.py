@@ -67,7 +67,7 @@ def main():
 
     # Validate URL format
     if not re.match(r'^[a-z0-9]+://', url):
-        error("URL must start with a valid scheme (e.g., https://, ssh://).")
+        error("URL must start with a scheme (e.g., https://, ssh://).")
 
     try:
         # Initialize connection

@@ -5,9 +5,56 @@ import json
 import binascii
 import getopt
 import re
+import time
 from keepassxc_proxy_client import protocol
 
+version = 1.1
 debug = 0
+
+# -------------
+
+
+class KeepassClientSignalWorkaround(protocol.Connection):
+    """Custom Connection class that handles unexpected KeePassXC signals properly."""
+
+    def __init__(self):
+        super().__init__()  # Initialize the parent class
+        self.last_signal = None  # Store the last signal message
+
+    def get_unencrypted_response(self):
+        """Fetches a response from KeePassXC, storing last signal messages and skipping them."""
+        data = []
+
+        while True:
+            new_data = self.socket.recv(4096)
+            if new_data:
+                decoded_data = new_data.decode('utf-8')
+                data.append(decoded_data)
+            else:
+                break
+            if len(new_data) < 4096:
+                break
+
+        response = json.loads(''.join(data))
+
+        # Detect simple signal messages like { "action": "database-unlocked" }
+        if isinstance(response, dict) and len(response) == 1 and "action" in response:
+            self.last_signal = response["action"]  # Store signal
+            debug_print(f"[DEBUG] Stored last signal: {self.last_signal}")
+            return self.get_unencrypted_response()  # Fetch next response instead
+
+        return response  # Return valid response
+
+    # Unused for now, but if we get a "user-closed-password-dialog"-ish signal one day, we can use it
+    # to break out of the wait loop.
+    def get_last_signal(self):
+        """Retrieves and clears the last received signal message."""
+        signal = self.last_signal
+        self.last_signal = None  # Clear after reading
+        return signal
+
+
+# -------------
 
 def print_help():
     help_text = """
@@ -22,13 +69,18 @@ Options:
                                    %l - Login/username
                                    %p - Password
   -n                             Suppress newline after each entry's output.
+  -w <sec>                       Wait max number of sec for the user to enter password in keepass. 0=no-wait. (default=30)
+  -v                             Print version
   -h, --help                     Display this help message.
 """
     print(help_text)
 
 def debug_print(message):
     if debug:
-        print(f"[DEBUG] {message}", file=sys.stderr)
+        import inspect
+        frame = inspect.currentframe().f_back  # Get the caller's frame
+        lineno = frame.f_lineno  # Get the line number of the caller
+        print(f"[DEBUG:{lineno}] {message}", file=sys.stderr)
 
 def error(message):
     print(f"[ERROR] {message}", file=sys.stderr)
@@ -40,10 +92,12 @@ def main():
     url = None
     output_format = "Name: %n\nLogin: %l\nPassword: %p\n"
     add_newline = True  # Default to adding newline after each entry
+    max_wait = 30
+    retry_sleep = 1
 
     # Parse command-line arguments
     try:
-        opts, args = getopt.getopt(sys.argv[1:], "u:k:f:nh", ["url=", "keyfile=", "format=", "help"])
+        opts, args = getopt.getopt(sys.argv[1:], "u:k:f:nw:vh", ["url=", "keyfile=", "format=", "help"])
     except getopt.GetoptError as err:
         error(str(err))
 
@@ -54,8 +108,16 @@ def main():
             keyfile_path = arg
         elif opt in ("-f", "--format"):
             output_format = arg
+        elif opt == "-w":
+            try:
+                max_wait = int(arg)
+            except ValueError:
+                error("int expected for -w")
         elif opt == "-n":
             add_newline = False
+        elif opt == "-v":
+            print(version)
+            sys.exit(0)
         elif opt in ("-h", "--help"):
             print_help()
             sys.exit(0)
@@ -71,7 +133,7 @@ def main():
 
     try:
         # Initialize connection
-        connection = protocol.Connection()
+        connection = KeepassClientSignalWorkaround()
         connection.connect()
 
         if not os.path.exists(keyfile_path):
@@ -105,15 +167,45 @@ def main():
             except (json.JSONDecodeError, ValueError, binascii.Error) as e:
                 error(f"Failed to load association: {e}\n\nPlease delete the keyfile and re-run the script to re-associate.")
 
-        # Test association
-        try:
-            if not connection.test_associate():
-                error("Association test failed. Please re-associate.")
-        except protocol.ResponseUnsuccesfulException as e:
-            error_data = e.args[0] if e.args else {}
-            error_message = error_data.get("error", "Unknown error")
-            error_code = error_data.get("errorCode", "1")
-            error(f"Connection error: {error_message} (Code: {error_code})")
+            # Test association
+            try:
+                trigger_unlock = True # Triggers keepassxc gui to pop up a dialog for entering password
+                start_time = time.time()
+                stored_nonce = None  # Store nonce if received
+
+                while True:
+                    error_code = "0"
+                    e = None
+
+                    try:
+                        response = connection.test_associate(trigger_unlock)  # Try associating
+                    except protocol.ResponseUnsuccesfulException as e:
+                        error_data = e.args[0] if e.args else {}
+                        error_message = error_data.get("error", "Unknown error")
+                        error_code = error_data.get("errorCode", "1")
+
+                    trigger_unlock = False  # Only trigger unlock once
+
+                    if max_wait == "0" or error_code == "0":  # Don't retry
+                        break
+
+                    if error_code != "1":
+                        print(error_code)
+                        raise e  # Only raise the original exception if it's not a "database locked" error
+
+                    if time.time() - start_time >= max_wait:
+                        error(f"Timeout while waiting for user to unlock database")
+                        break
+
+                    debug_print("Waiting for unlocking of database")
+                    time.sleep(retry_sleep)
+
+            except protocol.ResponseUnsuccesfulException as e:
+                error_data = e.args[0] if e.args else {}
+                error_message = error_data.get("error", "Unknown error")
+                error_code = error_data.get("errorCode", "1")
+                error(f"Connection error: {error_message} (Code: {error_code})")
+
 
         # Retrieve logins for the specified URL
         try:
@@ -133,6 +225,8 @@ def main():
             error(f"Error retrieving logins: {error_message}")
 
     except Exception as e:
+        if debug:
+           raise(e)
         error(f"Unexpected error: {e}")
 
 if __name__ == "__main__":

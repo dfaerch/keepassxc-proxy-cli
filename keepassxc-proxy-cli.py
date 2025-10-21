@@ -134,7 +134,10 @@ def main():
     try:
         # Initialize connection
         connection = KeepassClientSignalWorkaround()
-        connection.connect()
+        try:
+            connection.connect()
+        except:
+            error("Unable to connect to KeePassXC")
 
         if not os.path.exists(keyfile_path):
             # Associate with KeePassXC and dump association details
